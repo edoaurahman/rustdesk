@@ -721,6 +721,8 @@ fn run(vs: VideoService) -> ResultType<()> {
 
     #[cfg(target_os = "linux")]
     let mut would_block_count = 0u32;
+    #[cfg(target_os = "linux")]
+    let mut wayland_frame_size: Option<(usize, usize)> = None;
     let mut yuv = Vec::new();
     let mut mid_data = Vec::new();
     let mut repeat_encode_counter = 0;
@@ -800,6 +802,16 @@ fn run(vs: VideoService) -> ResultType<()> {
             Ok(frame) => {
                 repeat_encode_counter = 0;
                 if frame.valid() {
+                    #[cfg(target_os = "linux")]
+                    if let scrap::Frame::PixelBuffer(f) = &frame {
+                        if !is_x11()
+                            && *wayland_frame_size.get_or_insert((f.width(), f.height()))
+                                != (f.width(), f.height())
+                        {
+                            log::info!("switch due to wayland frame size changed");
+                            bail!("SWITCH");
+                        }
+                    }
                     let screenshot_key = (vs.source, display_idx);
                     let screenshot = SCREENSHOTS.lock().unwrap().remove(&screenshot_key);
                     if let Some(mut screenshot) = screenshot {

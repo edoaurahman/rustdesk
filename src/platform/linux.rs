@@ -1880,6 +1880,9 @@ fn get_xrandr_conn_pat(name: &str) -> String {
 }
 
 pub fn resolutions(name: &str) -> Vec<Resolution> {
+    if !is_x11() {
+        return kde_wayland_resolution::resolutions(name);
+    }
     let resolutions_pat = r"(?P<resolutions>(\s*\d+x\d+\s+\d+.*\n)+)";
     let connected_pat = get_xrandr_conn_pat(name);
     let mut v = vec![];
@@ -1942,6 +1945,9 @@ pub fn resolutions(name: &str) -> Vec<Resolution> {
 }
 
 pub fn current_resolution(name: &str) -> ResultType<Resolution> {
+    if !is_x11() {
+        return kde_wayland_resolution::current_resolution(name);
+    }
     let xrandr_output = run_cmds("xrandr --query | tr -s ' '")?;
     let re = Regex::new(&get_xrandr_conn_pat(name))?;
     if let Some(caps) = re.captures(&xrandr_output) {
@@ -1957,6 +1963,9 @@ pub fn current_resolution(name: &str) -> ResultType<Resolution> {
 }
 
 pub fn change_resolution_directly(name: &str, width: usize, height: usize) -> ResultType<()> {
+    if !is_x11() {
+        return kde_wayland_resolution::change_resolution(name, width, height);
+    }
     Command::new("xrandr")
         .args(vec![
             "--output",
@@ -2960,6 +2969,156 @@ pub fn has_gnome_shortcuts_inhibitor_permission() -> bool {
         Err(e) => {
             log::debug!("Failed to query shortcuts inhibitor permission: {}", e);
             false
+        }
+    }
+}
+
+mod kde_wayland_resolution {
+    use super::*;
+    use serde_json::Value;
+
+    fn kscreen_doctor(args: &[&str]) -> ResultType<std::process::Output> {
+        if !is_kde_session() {
+            bail!("Changing resolution on Wayland is only supported on KDE Plasma");
+        }
+        let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
+            .unwrap_or_else(|_| format!("/run/user/{}", unsafe { hbb_common::libc::getuid() }));
+        let mut cmd = Command::new("timeout");
+        cmd.arg("3").arg("kscreen-doctor").args(args);
+        cmd.env("QT_QPA_PLATFORM", "wayland");
+        if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+            cmd.env("WAYLAND_DISPLAY", "wayland-0");
+            for i in 0..10 {
+                if Path::new(&format!("{}/wayland-{}", runtime_dir, i)).exists() {
+                    cmd.env("WAYLAND_DISPLAY", format!("wayland-{}", i));
+                    break;
+                }
+            }
+        }
+        if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
+            cmd.env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                format!("unix:path={}/bus", runtime_dir),
+            );
+        }
+        cmd.env("XDG_RUNTIME_DIR", &runtime_dir);
+        let output = cmd.output()?;
+        if !output.status.success() {
+            bail!(
+                "kscreen-doctor failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(output)
+    }
+
+    fn output_json(name: &str) -> ResultType<Value> {
+        let json: Value = serde_json::from_slice(&kscreen_doctor(&["-j"])?.stdout)?;
+        output_by_name(json, name)
+    }
+
+    fn output_by_name(json: Value, name: &str) -> ResultType<Value> {
+        let Value::Array(outputs) = json["outputs"].clone() else {
+            bail!("No outputs in kscreen-doctor output");
+        };
+        match outputs.into_iter().find(|o| o["name"] == name) {
+            Some(o) => Ok(o),
+            None => bail!("Output {} not found", name),
+        }
+    }
+
+    fn mode_size(mode: &Value) -> Option<(i32, i32)> {
+        Some((
+            mode["size"]["width"].as_i64()? as _,
+            mode["size"]["height"].as_i64()? as _,
+        ))
+    }
+
+    fn list(output: &Value) -> Vec<Resolution> {
+        let mut v = vec![];
+        for (width, height) in output["modes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(mode_size)
+        {
+            let r = Resolution {
+                width,
+                height,
+                ..Default::default()
+            };
+            if !v.contains(&r) {
+                v.push(r);
+            }
+        }
+        v.sort_by(|a, b| (b.width, b.height).cmp(&(a.width, a.height)));
+        v
+    }
+
+    fn mode_id(output: &Value, width: i32, height: i32) -> Option<String> {
+        output["modes"]
+            .as_array()?
+            .iter()
+            .filter(|m| mode_size(m) == Some((width, height)))
+            .max_by(|a, b| {
+                let rate = |m: &Value| m["refreshRate"].as_f64().unwrap_or(0.);
+                rate(a).total_cmp(&rate(b))
+            })
+            .and_then(|m| m["id"].as_str().map(str::to_owned))
+    }
+
+    pub fn resolutions(name: &str) -> Vec<Resolution> {
+        if name.is_empty() {
+            return vec![];
+        }
+        match output_json(name) {
+            Ok(output) => list(&output),
+            Err(e) => {
+                log::debug!("Failed to get wayland resolutions of {}: {}", name, e);
+                vec![]
+            }
+        }
+    }
+
+    pub fn current_resolution(name: &str) -> ResultType<Resolution> {
+        let output = output_json(name)?;
+        let Some((width, height)) = mode_size(&output) else {
+            bail!("Failed to find current resolution for {}", name);
+        };
+        Ok(Resolution {
+            width,
+            height,
+            ..Default::default()
+        })
+    }
+
+    pub fn change_resolution(name: &str, width: usize, height: usize) -> ResultType<()> {
+        let output = output_json(name)?;
+        let Some(id) = mode_id(&output, width as _, height as _) else {
+            bail!("No mode {}x{} for {}", width, height, name);
+        };
+        kscreen_doctor(&[&format!("output.{}.mode.{}", name, id)])?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn parse_kscreen_doctor_json() {
+            let json: Value = serde_json::from_str(
+                r#"{"outputs":[{"name":"DP-1","size":{"width":3440,"height":1440},"modes":[
+                {"id":"1","refreshRate":59.97,"size":{"width":3440,"height":1440}},
+                {"id":"2","refreshRate":180.0,"size":{"width":3440,"height":1440}},
+                {"id":"3","refreshRate":60.0,"size":{"width":1920,"height":1080}}]}]}"#,
+            )
+            .unwrap();
+            let output = output_by_name(json, "DP-1").unwrap();
+            let sizes: Vec<_> = list(&output).iter().map(|r| (r.width, r.height)).collect();
+            assert_eq!(sizes, vec![(3440, 1440), (1920, 1080)]);
+            assert_eq!(mode_id(&output, 3440, 1440).as_deref(), Some("2"));
+            assert_eq!(mode_size(&output), Some((3440, 1440)));
         }
     }
 }
