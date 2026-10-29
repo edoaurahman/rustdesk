@@ -4868,16 +4868,22 @@ impl Connection {
                             (r.width, r.height),
                         );
                     }
-                    if let Err(e) =
-                        crate::platform::change_resolution(&name, r.width as _, r.height as _)
-                    {
-                        log::error!(
+                    match crate::platform::change_resolution(&name, r.width as _, r.height as _) {
+                        Ok(_) => {
+                            // PipeWire stream keeps old size after mode change; rebuild capture.
+                            #[cfg(target_os = "linux")]
+                            if !crate::platform::linux::is_x11() {
+                                scrap::wayland::display::clear_wayland_displays_cache();
+                                self.refresh_video_display(Some(display_idx));
+                            }
+                        }
+                        Err(e) => log::error!(
                             "Failed to change resolution '{}' to ({},{}): {:?}",
                             &name,
                             r.width,
                             r.height,
                             e
-                        );
+                        ),
                     }
                 }
             }
