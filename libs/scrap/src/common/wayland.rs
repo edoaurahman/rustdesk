@@ -124,6 +124,15 @@ impl Display {
     }
 
     pub fn name(&self) -> String {
-        "".to_owned()
+        let displays = display::get_displays();
+        if let [d] = displays.displays.as_slice() {
+            return d.name.clone();
+        }
+        displays
+            .displays
+            .iter()
+            .find(|d| (d.x, d.y) == self.0.position)
+            .map(|d| d.name.clone())
+            .unwrap_or_default()
     }
 }
