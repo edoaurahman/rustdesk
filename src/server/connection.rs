@@ -4833,6 +4833,39 @@ impl Connection {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn change_resolution(&mut self, d: Option<usize>, r: &Resolution) {
         if self.keyboard {
+            // Display::all() on wayland opens a new pipewire pipeline while capture runs and
+            // can block this connection for ~30s; use the synced display info instead.
+            #[cfg(target_os = "linux")]
+            if !crate::platform::linux::is_x11() {
+                let display_idx = d.unwrap_or(self.display_idx);
+                if let Some(display) = display_service::get_display_info(display_idx) {
+                    display_service::set_last_changed_resolution(
+                        &display.name,
+                        (display.width, display.height),
+                        (r.width, r.height),
+                    );
+                    match crate::platform::change_resolution(
+                        &display.name,
+                        r.width as _,
+                        r.height as _,
+                    ) {
+                        Ok(_) => {
+                            // Portal stream keeps old size after mode change; open a new
+                            // portal session (restore token avoids re-prompt) and rebuild capture.
+                            scrap::wayland::pipewire::close_session();
+                            self.refresh_video_display(Some(display_idx));
+                        }
+                        Err(e) => log::error!(
+                            "Failed to change resolution '{}' to ({},{}): {:?}",
+                            &display.name,
+                            r.width,
+                            r.height,
+                            e
+                        ),
+                    }
+                }
+                return;
+            }
             if let Ok(displays) = display_service::try_get_displays() {
                 let display_idx = d.unwrap_or(self.display_idx);
                 if let Some(display) = displays.get(display_idx) {
@@ -4868,23 +4901,16 @@ impl Connection {
                             (r.width, r.height),
                         );
                     }
-                    match crate::platform::change_resolution(&name, r.width as _, r.height as _) {
-                        Ok(_) => {
-                            // Portal stream keeps old size after mode change; open a new
-                            // portal session (restore token avoids re-prompt) and rebuild capture.
-                            #[cfg(target_os = "linux")]
-                            if !crate::platform::linux::is_x11() {
-                                scrap::wayland::pipewire::close_session();
-                                self.refresh_video_display(Some(display_idx));
-                            }
-                        }
-                        Err(e) => log::error!(
+                    if let Err(e) =
+                        crate::platform::change_resolution(&name, r.width as _, r.height as _)
+                    {
+                        log::error!(
                             "Failed to change resolution '{}' to ({},{}): {:?}",
                             &name,
                             r.width,
                             r.height,
                             e
-                        ),
+                        );
                     }
                 }
             }
