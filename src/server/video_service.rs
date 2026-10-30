@@ -628,6 +628,10 @@ fn run(vs: VideoService) -> ResultType<()> {
     let dxgi_recovery_state = vs.dxgi_recovery_state.clone();
     let sp = vs.sp;
     let mut c = get_capturer(vs.source, display_idx, last_portable_service_running)?;
+    #[cfg(target_os = "linux")]
+    if vs.source.is_monitor() && !is_x11() {
+        broadcast_wayland_size_changed(&sp, display_idx, (c.width, c.height));
+    }
     #[cfg(windows)]
     // ACCESS_LOST marks the next successful capturer creation as a recovery. This timestamp is
     // consumed once and temporarily holds off the normal WouldBlock-to-GDI fallback, giving the
@@ -1374,6 +1378,22 @@ fn try_broadcast_display_changed(
         }
     }
     Ok(())
+}
+
+// check_display_changed() is x11-only; tell clients when wayland capture restarts with a new size.
+#[cfg(target_os = "linux")]
+fn broadcast_wayland_size_changed(sp: &GenericService, display_idx: usize, size: (usize, usize)) {
+    lazy_static::lazy_static! {
+        static ref LAST: Mutex<HashMap<usize, (usize, usize)>> = Default::default();
+    }
+    let prev = LAST.lock().unwrap().insert(display_idx, size);
+    if prev.map_or(true, |p| p == size) {
+        return;
+    }
+    if let Some(msg) = make_display_changed_msg(display_idx, None, VideoSource::Monitor) {
+        log::info!("wayland display {display_idx} size changed {prev:?} -> {size:?}");
+        sp.send_shared(Arc::new(msg));
+    }
 }
 
 pub fn make_display_changed_msg(
