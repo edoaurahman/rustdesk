@@ -4797,10 +4797,11 @@ impl Connection {
                     }
                     match crate::platform::change_resolution(&name, r.width as _, r.height as _) {
                         Ok(_) => {
-                            // PipeWire stream keeps old size after mode change; rebuild capture.
+                            // Portal stream keeps old size after mode change; open a new
+                            // portal session (restore token avoids re-prompt) and rebuild capture.
                             #[cfg(target_os = "linux")]
                             if !crate::platform::linux::is_x11() {
-                                scrap::wayland::display::clear_wayland_displays_cache();
+                                scrap::wayland::pipewire::close_session();
                                 self.refresh_video_display(Some(display_idx));
                             }
                         }
